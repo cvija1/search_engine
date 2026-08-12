@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
@@ -11,7 +12,14 @@ use xml::reader::{EventReader, XmlEvent::Characters};
 mod lexer;
 use lexer::Lexer;
 type TF = HashMap<String, usize>;
-type TFIndex = HashMap<PathBuf, TF>;
+type DocFreq = HashMap<String, usize>;
+type TFIndex = HashMap<PathBuf, (usize, TF)>;
+
+#[derive(Default, Deserialize, Serialize)]
+struct Model {
+    df: DocFreq,
+    tfi: TFIndex,
+}
 
 fn read_entire_xml_file<P: AsRef<Path>>(file_path: P) -> io::Result<String> {
     let file = File::open(file_path)?;
@@ -55,18 +63,18 @@ fn serve_404(request: Request) -> Result<(), ()> {
         })
 }
 
-fn tf(t: &str, d: &TF) -> f32 {
-    *d.get(t).unwrap_or(&0) as f32 / d.iter().map(|(_, f)| *f).sum::<usize>() as f32
+fn tf(t: &str, n: usize, d: &TF) -> f32 {
+    *d.get(t).unwrap_or(&0) as f32 / n as f32
 }
 
-fn idf(t: &str, d: &TFIndex) -> f32 {
-    let n = d.len() as f32;
-    let count = d.values().filter(|tf| tf.contains_key(t)).count() as f32;
+fn idf(t: &str, n: usize, d: &DocFreq) -> f32 {
+    let n = n as f32;
+    let count = *d.get(t).unwrap_or(&0) as f32;
 
     ((n + 1.0) / (count + 1.0)).log10() + 1.0
 }
 
-fn serve_request(tf_index: &TFIndex, mut request: Request) -> Result<(), ()> {
+fn serve_request(model: &Model, mut request: Request) -> Result<(), ()> {
     println!(
         "receiver request method: {:?}, url:{:?}",
         request.method(),
@@ -81,10 +89,11 @@ fn serve_request(tf_index: &TFIndex, mut request: Request) -> Result<(), ()> {
                 .chars()
                 .collect::<Vec<_>>();
             let mut result = Vec::<(&Path, f32)>::new();
-            for (path, tf_table) in tf_index {
+            for (path, (n, tf_table)) in &model.tfi {
                 let mut total_tf_idf: f32 = 0.0;
                 for token in Lexer::new(&body) {
-                    total_tf_idf += tf(&token, tf_table) * idf(&token, tf_index);
+                    total_tf_idf +=
+                        tf(&token, *n, tf_table) * idf(&token, model.tfi.len(), &model.df);
                 }
                 result.push((path, total_tf_idf));
             }
@@ -118,7 +127,7 @@ fn serve_request(tf_index: &TFIndex, mut request: Request) -> Result<(), ()> {
     Ok(())
 }
 
-fn entry(index: &TFIndex) -> Result<(), ()> {
+fn entry(model: &Model) -> Result<(), ()> {
     let mut args = env::args();
     let program = args.next().expect("path to program is provided");
 
@@ -135,7 +144,7 @@ fn entry(index: &TFIndex) -> Result<(), ()> {
 
             println!("Listening at {address}");
             for request in server.incoming_requests() {
-                let _ = serve_request(index, request);
+                let _ = serve_request(model, request);
             }
             return Ok(());
         }
@@ -149,13 +158,13 @@ fn entry(index: &TFIndex) -> Result<(), ()> {
 }
 
 fn main() -> ExitCode {
-    let index: TFIndex = index();
-    match entry(&index) {
+    let model: Model = index();
+    match entry(&model) {
         Ok(()) => ExitCode::SUCCESS,
         Err(()) => ExitCode::FAILURE,
     }
 }
-fn index() -> TFIndex {
+fn index() -> Model {
     let index_path = "index.json";
     let index_file = File::open(index_path);
     if let Ok(index_file) = index_file {
@@ -172,12 +181,12 @@ fn index() -> TFIndex {
     }
 }
 
-fn index_folder(tf_index: &mut TFIndex, dir_path: &Path) -> Result<(), io::Error> {
+fn index_folder(model: &mut Model, dir_path: &Path) -> Result<(), io::Error> {
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
         let file_path = entry.path();
         if file_path.is_dir() {
-            index_folder(tf_index, &file_path)?;
+            index_folder(model, &file_path)?;
         } else {
             if file_path.extension().is_some_and(|ext| ext == "xhtml") {
                 println!("Indexing {file_path:?}");
@@ -186,31 +195,40 @@ fn index_folder(tf_index: &mut TFIndex, dir_path: &Path) -> Result<(), io::Error
                     .collect::<Vec<_>>();
                 let mut tf = TF::new();
 
+                let mut count = 0;
                 for token in Lexer::new(&content) {
                     *tf.entry(token).or_insert(0) += 1;
+                    count += 1;
+                }
+                for t in tf.keys() {
+                    if let Some(freq) = model.df.get_mut(t) {
+                        *freq += 1;
+                    } else {
+                        model.df.insert(t.to_string(), 1);
+                    }
                 }
                 let mut stats = tf.iter().collect::<Vec<_>>();
                 stats.sort_by_key(|(_, f)| **f);
                 stats.reverse();
 
-                tf_index.insert(file_path, tf);
+                model.tfi.insert(file_path, (count, tf));
             }
         }
     }
     Ok(())
 }
 
-fn create_index() -> Result<TFIndex, io::Error> {
-    let mut tf_index = TFIndex::new();
+fn create_index() -> Result<Model, io::Error> {
+    let mut model: Model = Default::default();
     let index_path = "index.json";
     println!("Saving {index_path}...");
     let dir_path = Path::new(r"C:\rust_projekti\search_engine\docs.gl");
 
-    let _ = index_folder(&mut tf_index, dir_path);
+    let _ = index_folder(&mut model, dir_path);
     let file = File::create(index_path)?;
     let writer = BufWriter::new(file);
 
-    serde_json::to_writer_pretty(writer, &tf_index)?;
+    serde_json::to_writer_pretty(writer, &model)?;
     let index_file = File::open(index_path);
     if let Ok(index_file) = index_file {
         let read_buf = BufReader::new(index_file);
