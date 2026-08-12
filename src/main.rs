@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter},
     path::{Path, PathBuf},
-    process::{self, ExitCode},
+    process::ExitCode,
 };
 use tiny_http::{Header, Method, Request, Response, Server};
 use xml::reader::{EventReader, XmlEvent::Characters};
@@ -38,6 +38,7 @@ fn read_entire_xml_file<P: AsRef<Path>>(file_path: P) -> io::Result<String> {
 fn usage(program: &str) {
     eprintln!("Usage: {program} [SUBCOMMAND] [OPTIONS]");
     eprintln!("Subcommands:");
+    eprintln!("    index <folder>                 index folder with .xhtml files");
     eprintln!("    serve <folder> [address]       start local HTTP server with Web Interface");
 }
 
@@ -74,7 +75,38 @@ fn idf(t: &str, n: usize, d: &DocFreq) -> f32 {
     ((n + 1.0) / (count + 1.0)).log10() + 1.0
 }
 
-fn serve_request(model: &Model, mut request: Request) -> Result<(), ()> {
+fn search_for_best_document(mut request: Request, model: &Model) -> Result<(), ()> {
+    let mut buf = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut buf);
+    let body = str::from_utf8(&buf)
+        .map_err(|err| eprintln!("Can not get body : {err}"))?
+        .chars()
+        .collect::<Vec<_>>();
+    let mut result = Vec::<(&Path, f32)>::new();
+    for (path, (n, tf_table)) in &model.tfi {
+        let mut total_tf_idf: f32 = 0.0;
+        for token in Lexer::new(&body) {
+            total_tf_idf += tf(&token, *n, tf_table) * idf(&token, model.tfi.len(), &model.df);
+        }
+        result.push((path, total_tf_idf));
+    }
+
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let response_string = result
+        .iter()
+        .take(10)
+        .map(|res| res.0.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    request
+        .respond(Response::from_string(response_string))
+        .map_err(|err| eprintln!("Can not make response : {err}"))?;
+
+    Ok(())
+}
+
+fn serve_request(model: &Model, request: Request) -> Result<(), ()> {
     println!(
         "receiver request method: {:?}, url:{:?}",
         request.method(),
@@ -82,33 +114,7 @@ fn serve_request(model: &Model, mut request: Request) -> Result<(), ()> {
     );
     match (request.method(), request.url()) {
         (Method::Post, "/api/search") => {
-            let mut buf = Vec::new();
-            let _ = request.as_reader().read_to_end(&mut buf);
-            let body = str::from_utf8(&buf)
-                .map_err(|err| eprintln!("Can not get body : {err}"))?
-                .chars()
-                .collect::<Vec<_>>();
-            let mut result = Vec::<(&Path, f32)>::new();
-            for (path, (n, tf_table)) in &model.tfi {
-                let mut total_tf_idf: f32 = 0.0;
-                for token in Lexer::new(&body) {
-                    total_tf_idf +=
-                        tf(&token, *n, tf_table) * idf(&token, model.tfi.len(), &model.df);
-                }
-                result.push((path, total_tf_idf));
-            }
-
-            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let response_string = result
-                .iter()
-                .take(10)
-                .map(|res| res.0.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            request
-                .respond(Response::from_string(response_string))
-                .map_err(|err| eprintln!("Can not make response : {err}"))?;
+            let _ = search_for_best_document(request, model);
         }
 
         (Method::Get, "/") | (Method::Get, "/index.html") => {
@@ -127,7 +133,7 @@ fn serve_request(model: &Model, mut request: Request) -> Result<(), ()> {
     Ok(())
 }
 
-fn entry(model: &Model) -> Result<(), ()> {
+fn entry() -> Result<(), ()> {
     let mut args = env::args();
     let program = args.next().expect("path to program is provided");
 
@@ -137,14 +143,24 @@ fn entry(model: &Model) -> Result<(), ()> {
     })?;
 
     match subcommand.as_str() {
+        "index" => {
+            let path = args.next().ok_or_else(|| {
+                usage(&program);
+                eprintln!("ERROR: no path to directory is provided");
+            })?;
+            let _ = create_index(&path);
+            return Ok(());
+        }
+
         "serve" => {
+            let model: Model = read_index()?;
             let address = args.next().unwrap_or("127.0.0.1:6969".to_string());
             let server = Server::http(&address)
                 .map_err(|e| eprintln!("Error: could not start http server at {address} : {e}"))?;
 
             println!("Listening at {address}");
             for request in server.incoming_requests() {
-                let _ = serve_request(model, request);
+                let _ = serve_request(&model, request);
             }
             return Ok(());
         }
@@ -158,27 +174,20 @@ fn entry(model: &Model) -> Result<(), ()> {
 }
 
 fn main() -> ExitCode {
-    let model: Model = index();
-    match entry(&model) {
+    match entry() {
         Ok(()) => ExitCode::SUCCESS,
         Err(()) => ExitCode::FAILURE,
     }
 }
-fn index() -> Model {
+
+fn read_index() -> Result<Model, ()> {
     let index_path = "index.json";
-    let index_file = File::open(index_path);
-    if let Ok(index_file) = index_file {
-        let read_buf = BufReader::new(index_file);
-        serde_json::from_reader(read_buf).expect("Index file can not be read")
-    } else {
-        match create_index() {
-            Ok(index) => index,
-            Err(e) => {
-                eprintln!("{e}");
-                process::exit(1)
-            }
-        }
-    }
+    let index_file =
+        File::open(index_path).map_err(|err| eprintln!("Can not open index file : {err}"))?;
+    let read_buf = BufReader::new(index_file);
+    serde_json::from_reader(read_buf).map_err(|err| {
+        eprintln!("Index file can not be read: {err}");
+    })
 }
 
 fn index_folder(model: &mut Model, dir_path: &Path) -> Result<(), io::Error> {
@@ -218,25 +227,19 @@ fn index_folder(model: &mut Model, dir_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn create_index() -> Result<Model, io::Error> {
+fn create_index(path: &str) -> Result<(), ()> {
     let mut model: Model = Default::default();
     let index_path = "index.json";
-    println!("Saving {index_path}...");
-    let dir_path = Path::new(r"C:\rust_projekti\search_engine\docs.gl");
+    let dir_path = Path::new(path);
 
     let _ = index_folder(&mut model, dir_path);
-    let file = File::create(index_path)?;
+    let file =
+        File::create(index_path).map_err(|err| eprintln!("Can not create index file : {err}"))?;
     let writer = BufWriter::new(file);
 
-    serde_json::to_writer_pretty(writer, &model)?;
-    let index_file = File::open(index_path);
-    if let Ok(index_file) = index_file {
-        let read_buf = BufReader::new(index_file);
-        serde_json::from_reader(read_buf).map_err(|err| {
-            eprintln!("{err}");
-            io::Error::new(io::ErrorKind::Other, "Error:")
-        })
-    } else {
-        Err(io::Error::new(io::ErrorKind::Other, "Error"))
-    }
+    println!("Saving {index_path}...");
+    serde_json::to_writer_pretty(writer, &model)
+        .map_err(|err| eprintln!("Can not make entry in index file : {err}"))?;
+
+    Ok(())
 }
