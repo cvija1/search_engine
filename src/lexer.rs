@@ -41,24 +41,28 @@ impl<'a> Lexer<'a> {
             return Some(
                 self.chop_while(|c| c.is_numeric())
                     .into_iter()
-                    .map(|ch| ch.to_ascii_uppercase())
+                    .map(|ch| ch.to_ascii_lowercase())
                     .collect::<String>(),
             );
         }
 
         if self.content[0].is_alphabetic() {
-            return Some(
-                self.chop_while(|c| c.is_alphanumeric())
-                    .into_iter()
-                    .map(|ch| ch.to_ascii_uppercase())
-                    .collect::<String>(),
-            );
+            let mut term = self
+                .chop_while(|c| c.is_alphanumeric())
+                .into_iter()
+                .map(|ch| ch.to_ascii_lowercase())
+                .collect::<String>();
+            let mut env = crate::snowball::SnowballEnv::create(&term);
+            crate::snowball::algorithms::english_stemmer::stem(&mut env);
+            term = env.get_current().to_string();
+
+            return Some(term);
         }
 
         return Some(
             self.chop(1)
                 .into_iter()
-                .map(|ch| ch.to_ascii_uppercase())
+                .map(|ch| ch.to_ascii_lowercase())
                 .collect::<String>(),
         );
     }

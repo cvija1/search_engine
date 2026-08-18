@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+mod snowball;
 use std::{
     collections::HashMap,
     env,
@@ -153,7 +154,11 @@ fn entry() -> Result<(), ()> {
         }
 
         "serve" => {
-            let model: Model = read_index()?;
+            let path = args.next().ok_or_else(|| {
+                usage(&program);
+                eprintln!("ERROR: no path to index file is provided");
+            })?;
+            let model: Model = read_index(path)?;
             let address = args.next().unwrap_or("127.0.0.1:6969".to_string());
             let server = Server::http(&address)
                 .map_err(|e| eprintln!("Error: could not start http server at {address} : {e}"))?;
@@ -180,8 +185,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn read_index() -> Result<Model, ()> {
-    let index_path = "index.json";
+fn read_index(index_path: String) -> Result<Model, ()> {
     let index_file =
         File::open(index_path).map_err(|err| eprintln!("Can not open index file : {err}"))?;
     let read_buf = BufReader::new(index_file);
