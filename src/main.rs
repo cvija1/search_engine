@@ -7,6 +7,9 @@ use std::{
     io::{self, BufReader, BufWriter},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{Arc, Mutex},
+    thread,
+    time::SystemTime,
 };
 use tiny_http::{Header, Method, Request, Response, Server};
 use xml::reader::{EventReader, XmlEvent::Characters};
@@ -14,12 +17,19 @@ mod lexer;
 use lexer::Lexer;
 type TF = HashMap<String, usize>;
 type DocFreq = HashMap<String, usize>;
-type TFIndex = HashMap<PathBuf, (usize, TF)>;
+type Docs = HashMap<PathBuf, Doc>;
+
+#[derive(Deserialize, Serialize, Debug)]
+struct Doc {
+    tf: TF,
+    count: usize,
+    last_modified: SystemTime,
+}
 
 #[derive(Default, Deserialize, Serialize)]
 struct Model {
     df: DocFreq,
-    tfi: TFIndex,
+    docs: Docs,
 }
 
 fn read_entire_xml_file<P: AsRef<Path>>(file_path: P) -> io::Result<String> {
@@ -37,9 +47,8 @@ fn read_entire_xml_file<P: AsRef<Path>>(file_path: P) -> io::Result<String> {
 }
 
 fn usage(program: &str) {
-    eprintln!("Usage: {program} [SUBCOMMAND] [OPTIONS]");
-    eprintln!("Subcommands:");
-    eprintln!("    index <folder>                 index folder with .xhtml files");
+    eprintln!("Usage: {program} [COMMAND] [OPTIONS]");
+    eprintln!("Command:");
     eprintln!("    serve <folder> [address]       start local HTTP server with Web Interface");
 }
 
@@ -65,8 +74,8 @@ fn serve_404(request: Request) -> Result<(), ()> {
         })
 }
 
-fn tf(t: &str, n: usize, d: &TF) -> f32 {
-    *d.get(t).unwrap_or(&0) as f32 / n as f32
+fn tf(t: &str, doc: &Doc) -> f32 {
+    *doc.tf.get(t).unwrap_or(&0) as f32 / doc.count as f32
 }
 
 fn idf(t: &str, n: usize, d: &DocFreq) -> f32 {
@@ -76,7 +85,7 @@ fn idf(t: &str, n: usize, d: &DocFreq) -> f32 {
     ((n + 1.0) / (count + 1.0)).log10() + 1.0
 }
 
-fn search_for_best_document(mut request: Request, model: &Model) -> Result<(), ()> {
+fn search_for_best_document(mut request: Request, model: &Arc<Mutex<Model>>) -> Result<(), ()> {
     let mut buf = Vec::new();
     let _ = request.as_reader().read_to_end(&mut buf);
     let body = str::from_utf8(&buf)
@@ -84,15 +93,17 @@ fn search_for_best_document(mut request: Request, model: &Model) -> Result<(), (
         .chars()
         .collect::<Vec<_>>();
     let mut result = Vec::<(&Path, f32)>::new();
-    for (path, (n, tf_table)) in &model.tfi {
+
+    let model = model.lock().unwrap();
+    for (path, doc) in &model.docs {
         let mut total_tf_idf: f32 = 0.0;
         for token in Lexer::new(&body) {
-            total_tf_idf += tf(&token, *n, tf_table) * idf(&token, model.tfi.len(), &model.df);
+            total_tf_idf += tf(&token, doc) * idf(&token, model.docs.len(), &model.df);
         }
         result.push((path, total_tf_idf));
     }
 
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    result.sort_by(|a, b| b.1.total_cmp(&a.1));
     let response_string = result
         .iter()
         .take(10)
@@ -107,7 +118,7 @@ fn search_for_best_document(mut request: Request, model: &Model) -> Result<(), (
     Ok(())
 }
 
-fn serve_request(model: &Model, request: Request) -> Result<(), ()> {
+fn serve_request(model: &Arc<Mutex<Model>>, request: Request) -> Result<(), ()> {
     println!(
         "receiver request method: {:?}, url:{:?}",
         request.method(),
@@ -144,21 +155,20 @@ fn entry() -> Result<(), ()> {
     })?;
 
     match subcommand.as_str() {
-        "index" => {
-            let path = args.next().ok_or_else(|| {
-                usage(&program);
-                eprintln!("ERROR: no path to directory is provided");
-            })?;
-            let _ = create_index(&path);
-            return Ok(());
-        }
-
         "serve" => {
-            let path = args.next().ok_or_else(|| {
+            let folder_path = args.next().ok_or_else(|| {
                 usage(&program);
-                eprintln!("ERROR: no path to index file is provided");
+                eprintln!("ERROR: no path to folder is provided");
             })?;
-            let model: Model = read_index(path)?;
+            let index_path = "index.json";
+            let model: Arc<Mutex<Model>> = Arc::new(Mutex::new(
+                read_index(&index_path).unwrap_or(Default::default()),
+            ));
+
+            let model_clone = Arc::clone(&model);
+            thread::spawn(move || {
+                let _ = create_index(&folder_path, Some(model_clone), index_path);
+            });
             let address = args.next().unwrap_or("127.0.0.1:6969".to_string());
             let server = Server::http(&address)
                 .map_err(|e| eprintln!("Error: could not start http server at {address} : {e}"))?;
@@ -185,7 +195,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn read_index(index_path: String) -> Result<Model, ()> {
+fn read_index(index_path: &str) -> Result<Model, ()> {
     let index_file =
         File::open(index_path).map_err(|err| eprintln!("Can not open index file : {err}"))?;
     let read_buf = BufReader::new(index_file);
@@ -194,56 +204,129 @@ fn read_index(index_path: String) -> Result<Model, ()> {
     })
 }
 
-fn index_folder(model: &mut Model, dir_path: &Path) -> Result<(), io::Error> {
+fn remove_document(model: &Arc<Mutex<Model>>, file_path: &Path) {
+    let mut model = model.lock().unwrap();
+    if let Some(doc) = model.docs.remove(file_path) {
+        for t in doc.tf.keys() {
+            if let Some(f) = model.df.get_mut(t) {
+                *f -= 1;
+            }
+        }
+    }
+}
+
+fn add_document(
+    model: &Arc<Mutex<Model>>,
+    file_path: PathBuf,
+    last_modified: SystemTime,
+    content: &Vec<char>,
+) -> Result<(), ()> {
+    let mut tf = TF::new();
+    let mut count = 0;
+    for token in Lexer::new(&content) {
+        *tf.entry(token).or_insert(0) += 1;
+        count += 1;
+    }
+    let mut model = model.lock().unwrap();
+    for t in tf.keys() {
+        if let Some(freq) = model.df.get_mut(t) {
+            *freq += 1;
+        } else {
+            model.df.insert(t.to_string(), 1);
+        }
+    }
+    let mut stats = tf.iter().collect::<Vec<_>>();
+    stats.sort_by_key(|(_, f)| **f);
+    stats.reverse();
+
+    model.docs.insert(
+        file_path,
+        Doc {
+            count,
+            tf,
+            last_modified,
+        },
+    );
+
+    Ok(())
+}
+
+fn requires_reindex(
+    model: &Arc<Mutex<Model>>,
+    file_path: &PathBuf,
+    last_modified: SystemTime,
+) -> bool {
+    let model = model.lock().unwrap();
+    if let Some(doc) = model.docs.get(file_path) {
+        if doc.last_modified >= last_modified {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn index_folder(model: &Arc<Mutex<Model>>, dir_path: &Path) -> Result<(), io::Error> {
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
         let file_path = entry.path();
+        let last_modified = entry.metadata()?.modified()?;
         if file_path.is_dir() {
-            index_folder(model, &file_path)?;
+            index_folder(&model, &file_path)?;
         } else {
-            if file_path.extension().is_some_and(|ext| ext == "xhtml") {
-                println!("Indexing {file_path:?}");
-                let content = read_entire_xml_file(&file_path)?
-                    .chars()
-                    .collect::<Vec<_>>();
-                let mut tf = TF::new();
-
-                let mut count = 0;
-                for token in Lexer::new(&content) {
-                    *tf.entry(token).or_insert(0) += 1;
-                    count += 1;
-                }
-                for t in tf.keys() {
-                    if let Some(freq) = model.df.get_mut(t) {
-                        *freq += 1;
+            if file_path
+                .extension()
+                .is_some_and(|ext| ext == "xhtml" || ext == "pdf")
+            {
+                let need_reindex = requires_reindex(&model, &file_path, last_modified);
+                if need_reindex {
+                    println!("Indexing {file_path:?}");
+                    remove_document(&model, &file_path);
+                    let content;
+                    if file_path.extension().is_some_and(|ext| ext == "xhtml") {
+                        content = read_entire_xml_file(&file_path)?
+                            .chars()
+                            .collect::<Vec<_>>();
                     } else {
-                        model.df.insert(t.to_string(), 1);
-                    }
-                }
-                let mut stats = tf.iter().collect::<Vec<_>>();
-                stats.sort_by_key(|(_, f)| **f);
-                stats.reverse();
+                        let bytes = std::fs::read(&file_path)?;
 
-                model.tfi.insert(file_path, (count, tf));
+                        match pdf_extract::extract_text_from_mem(&bytes) {
+                            Ok(text) => content = text.chars().collect::<Vec<_>>(),
+                            Err(e) => {
+                                eprintln!("Error extracting text: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    add_document(&model, file_path, last_modified, &content).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "add_document failed")
+                    })?;
+                } else {
+                    println!("Skip indexing {file_path:?}");
+                }
             }
         }
     }
     Ok(())
 }
 
-fn create_index(path: &str) -> Result<(), ()> {
-    let mut model: Model = Default::default();
-    let index_path = "index.json";
-    let dir_path = Path::new(path);
+fn create_index(
+    folder_path: &str,
+    model: Option<Arc<Mutex<Model>>>,
+    index_path: &str,
+) -> Result<(), ()> {
+    let model: Arc<Mutex<Model>> = model.unwrap_or(Default::default());
+    let dir_path = Path::new(folder_path);
 
-    let _ = index_folder(&mut model, dir_path);
+    index_folder(&model, dir_path).map_err(|err| eprintln!("Can not create index : {err}"))?;
+
     let file =
         File::create(index_path).map_err(|err| eprintln!("Can not create index file : {err}"))?;
     let writer = BufWriter::new(file);
 
     println!("Saving {index_path}...");
-    serde_json::to_writer_pretty(writer, &model)
+    let model = model.lock().unwrap();
+    serde_json::to_writer_pretty(writer, &*model)
         .map_err(|err| eprintln!("Can not make entry in index file : {err}"))?;
-
+    println!("Saved {index_path}");
     Ok(())
 }
